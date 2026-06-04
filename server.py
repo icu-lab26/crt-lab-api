@@ -143,6 +143,16 @@ def health():
     return {"ok": True}
 
 
+class CheckReq(BaseModel):
+    passcode: str = ""
+
+
+@app.post("/check")
+def check(req: CheckReq):
+    # used by the lock screen; ok=True means the code is right (or no gate is set)
+    return {"ok": not _bad_pass(req.passcode)}
+
+
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), passcode: str = Form("")):
     if _bad_pass(passcode):
