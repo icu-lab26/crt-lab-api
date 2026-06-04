@@ -195,6 +195,8 @@ def check(req: CheckReq):
 
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), passcode: str = Form("")):
+    """Lightweight: just transcode and return a frame. Analysis happens on /measure,
+    after the user has positioned the boxes — keeps this step fast for big clips."""
     if _bad_pass(passcode):
         return {"error": "wrong passcode"}
     clip_id = uuid.uuid4().hex
@@ -210,16 +212,8 @@ async def upload(file: UploadFile = File(...), passcode: str = Form("")):
 
     base = _display_frame(work)
     W, H = _dims(work)
-    auto = crt.auto_roi(work)
-    if auto is None:
-        roi = (W // 2, H // 2, 80)
-        res = {"roi": list(roi), "crt90": None, "crt80": None, "span": None,
-               "quality": "no clear refill", "fps": None, "ita": None, "ita_class": ""}
-    else:
-        res = _measure(work, auto[:3])
-    res.update({"clip_id": clip_id, "frame": _jpg_b64(base) if base is not None else None,
-                "W": W, "H": H})
-    return res
+    return {"clip_id": clip_id, "frame": _jpg_b64(base) if base is not None else None,
+            "W": W, "H": H, "roi": [W // 2, H // 2, 80]}
 
 
 class MeasureReq(BaseModel):
@@ -268,6 +262,38 @@ def ita(req: ItaReq):
     cy = max(half, min(int(req.cy), H - half))
     val = crt.compute_ita(work, (cx, cy, size))
     return {"roi": [cx, cy, size], "ita": val, "ita_class": _ita_class(val)}
+
+
+class CurveReq(BaseModel):
+    clip_id: str
+    cx: int
+    cy: int
+    size: int = 80
+    passcode: str = ""
+
+
+@app.post("/curve")
+def curve(req: CurveReq):
+    """Recovery-curve diagram (a* over time with t0 and CRT markers) at the CRT box."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    work = CACHE / f"{req.clip_id}.mp4"
+    if not work.exists():
+        return {"error": "clip not found — please re-upload"}
+    W, H = _dims(work)
+    size = max(40, min(int(req.size), min(W, H)))
+    half = size // 2
+    cx = max(half, min(int(req.cx), W - half))
+    cy = max(half, min(int(req.cy), H - half))
+    ts, A, fps = crt.extract_signal(work, (cx, cy, size))
+    r = crt.compute_crt(ts, A)
+    if r is None:
+        return {"error": "no clear refill to plot"}
+    out = CACHE / f"{req.clip_id}_curve.png"
+    crt.plot_result(ts, A, r, out, "Recovery curve")
+    b = base64.b64encode(out.read_bytes()).decode()
+    out.unlink(missing_ok=True)
+    return {"curve": "data:image/png;base64," + b}
 
 
 @app.post("/photo")
