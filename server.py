@@ -518,3 +518,217 @@ def reading(req: ReadingReq):
     except Exception as e:
         return {"ok": False, "error": f"save failed: {e}"}
     return {"ok": True}
+
+
+# ============================ RESULTS / AGREEMENT ============================
+def _f(x):
+    try:
+        if x is None or x == "":
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _agree(a, b):
+    a = np.array(a, float); b = np.array(b, float)
+    d = a - b
+    n = int(len(d))
+    md = float(np.mean(d)); sd = float(np.std(d, ddof=1)) if n > 1 else 0.0
+    out = {
+        "n": n,
+        "mean_diff": round(md, 3),
+        "sd_diff": round(sd, 3),
+        "loa_low": round(md - 1.96 * sd, 3),
+        "loa_high": round(md + 1.96 * sd, 3),
+        "mean_abs_diff": round(float(np.mean(np.abs(d))), 3),
+        "within_0_5s": round(100 * float(np.mean(np.abs(d) <= 0.5)), 1),
+        "within_1s": round(100 * float(np.mean(np.abs(d) <= 1.0)), 1),
+    }
+    if n > 1 and np.std(a) > 0 and np.std(b) > 0:
+        out["pearson_r"] = round(float(np.corrcoef(a, b)[0, 1]), 3)
+    return out
+
+
+def _icc21(x):
+    x = np.array(x, float)
+    if x.ndim != 2:
+        return None
+    n, k = x.shape
+    if n < 2 or k < 2:
+        return None
+    grand = x.mean()
+    MSR = k * np.sum((x.mean(axis=1) - grand) ** 2) / (n - 1)
+    MSC = n * np.sum((x.mean(axis=0) - grand) ** 2) / (k - 1)
+    SST = np.sum((x - grand) ** 2)
+    SSE = SST - MSR * (n - 1) - MSC * (k - 1)
+    MSE = SSE / ((n - 1) * (k - 1))
+    denom = MSR + (k - 1) * MSE + k * (MSC - MSE) / n
+    if denom == 0:
+        return None
+    return round(float((MSR - MSE) / denom), 3)
+
+
+def _kappa(a, b):
+    a = np.array(a); b = np.array(b)
+    n = len(a)
+    if n == 0:
+        return None
+    po = float(np.mean(a == b))
+    p1 = np.mean(a); q1 = np.mean(b)
+    pe = p1 * q1 + (1 - p1) * (1 - q1)
+    if pe >= 1:
+        return 1.0
+    return round(float((po - pe) / (1 - pe)), 3)
+
+
+class ResultsReq(BaseModel):
+    passcode: str = ""
+
+
+@app.post("/results")
+def results(req: ResultsReq):
+    """Unblinded analysis: merge measurements + readings, compute agreement."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    try:
+        meas = fb_list("measurements")
+        reads = fb_list("readings")
+    except Exception as e:
+        return {"error": f"could not load: {e}"}
+
+    import itertools
+    THR = 3.0
+    by_clip = {}
+    reviewers = set()
+    for r in reads:
+        cid = r.get("clip_id")
+        rev = r.get("reviewer", "")
+        if not cid or not rev:
+            continue
+        reviewers.add(rev)
+        val = None if r.get("cant_assess") else _f(r.get("crt_reviewer_s"))
+        by_clip.setdefault(cid, {})[rev] = val
+    reviewers = sorted(reviewers)
+
+    rows = []
+    for m in meas:
+        cid = m.get("clip_id") or m["_id"]
+        rows.append({
+            "clip_id": cid,
+            "subject_id": m.get("subject_id", ""),
+            "site": m.get("site", ""),
+            "skin_class": m.get("skintone_ita_class", ""),
+            "algo_crt": _f(m.get("crt90_s")),
+            "bedside": _f(m.get("crt_stopwatch_a")),
+            "reviews": {rv: by_clip.get(cid, {}).get(rv) for rv in reviewers},
+            "n_reviews": sum(1 for rv in reviewers if by_clip.get(cid, {}).get(rv) is not None),
+        })
+
+    # inter-rater
+    interrater = None
+    if len(reviewers) >= 2:
+        A, B = [], []
+        for cid, revs in by_clip.items():
+            vals = {rv: v for rv, v in revs.items() if v is not None}
+            for r1, r2 in itertools.combinations(sorted(vals), 2):
+                A.append(vals[r1]); B.append(vals[r2])
+        if A:
+            interrater = _agree(A, B)
+            if len(reviewers) == 2:
+                r1, r2 = reviewers
+                mat = [[by_clip[c].get(r1), by_clip[c].get(r2)] for c in by_clip
+                       if by_clip[c].get(r1) is not None and by_clip[c].get(r2) is not None]
+                if len(mat) >= 2:
+                    interrater["icc"] = _icc21(mat)
+                ca = [1 if r[0] > THR else 0 for r in mat]
+                cb = [1 if r[1] > THR else 0 for r in mat]
+                if ca:
+                    interrater["kappa_3s"] = _kappa(ca, cb)
+
+    # reviewer vs algorithm (pooled)
+    rev_algo = None
+    RA, AA, cr, cax = [], [], [], []
+    for m in meas:
+        cid = m.get("clip_id") or m["_id"]
+        algo = _f(m.get("crt90_s"))
+        if algo is None:
+            continue
+        for rv in reviewers:
+            v = by_clip.get(cid, {}).get(rv)
+            if v is not None:
+                RA.append(v); AA.append(algo)
+                cr.append(1 if v > THR else 0); cax.append(1 if algo > THR else 0)
+    if RA:
+        rev_algo = _agree(RA, AA)
+        rev_algo["kappa_3s"] = _kappa(cr, cax)
+
+    # bedside vs algorithm
+    bed_algo = None
+    BB, BA = [], []
+    for m in meas:
+        algo = _f(m.get("crt90_s")); bed = _f(m.get("crt_stopwatch_a"))
+        if algo is not None and bed is not None:
+            BB.append(bed); BA.append(algo)
+    if BB:
+        bed_algo = _agree(BB, BA)
+
+    summary = {
+        "n_clips": len(meas),
+        "n_with_algo": sum(1 for m in meas if _f(m.get("crt90_s")) is not None),
+        "reviewers": reviewers,
+        "n_reviewed_by": {rv: sum(1 for row in rows if row["reviews"].get(rv) is not None) for rv in reviewers},
+        "threshold_s": THR,
+        "interrater": interrater,
+        "reviewer_vs_algo": rev_algo,
+        "bedside_vs_algo": bed_algo,
+    }
+    return {"reviewers": reviewers, "rows": rows, "summary": summary}
+
+
+# ============================ DELETE A CLIP ============================
+def fb_delete(coll, doc_id):
+    url = f"{FB_BASE}/{coll}/{doc_id}?key={FB_API_KEY}"
+    r = requests.delete(url, timeout=20)
+    if r.status_code not in (200, 404):
+        r.raise_for_status()
+
+
+def fb_delete_object(obj_path):
+    obj = urllib.parse.quote(obj_path, safe="")
+    url = f"https://firebasestorage.googleapis.com/v0/b/{FB_BUCKET}/o/{obj}"
+    requests.delete(url, timeout=30)  # best-effort; ignore result
+
+
+class DeleteReq(BaseModel):
+    clip_id: str
+    passcode: str = ""
+
+
+@app.post("/delete")
+def delete_clip(req: DeleteReq):
+    """Permanently delete a clip: Firestore record, Storage files, and its readings."""
+    if _bad_pass(req.passcode):
+        return {"ok": False, "error": "wrong passcode"}
+    if not req.clip_id:
+        return {"ok": False, "error": "no clip_id"}
+    notes = []
+    try:
+        fb_delete("measurements", req.clip_id)
+    except Exception as e:
+        notes.append(f"record: {e}")
+    for obj in (f"clips/{req.clip_id}.mp4", f"clips/{req.clip_id}_skin.jpg"):
+        try:
+            fb_delete_object(obj)
+        except Exception:
+            pass
+    try:
+        for rd in fb_list("readings"):
+            if rd.get("clip_id") == req.clip_id:
+                try:
+                    fb_delete("readings", rd["_id"])
+                except Exception:
+                    pass
+    except Exception as e:
+        notes.append(f"readings: {e}")
+    return {"ok": True, "note": "; ".join(notes)}
