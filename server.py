@@ -69,6 +69,17 @@ def fb_upload_video(local_path, clip_id):
     return (f"https://firebasestorage.googleapis.com/v0/b/{FB_BUCKET}/o/"
             f"{obj}?alt=media&token={token}")
 
+
+def fb_upload_photo(local_path, clip_id):
+    obj = urllib.parse.quote(f"clips/{clip_id}_skin.jpg", safe="")
+    up = f"https://firebasestorage.googleapis.com/v0/b/{FB_BUCKET}/o?uploadType=media&name={obj}"
+    with open(local_path, "rb") as f:
+        r = requests.post(up, data=f.read(), headers={"Content-Type": "image/jpeg"}, timeout=120)
+    r.raise_for_status()
+    token = (r.json().get("downloadTokens") or "").split(",")[0]
+    return (f"https://firebasestorage.googleapis.com/v0/b/{FB_BUCKET}/o/"
+            f"{obj}?alt=media&token={token}")
+
 app = FastAPI(title="Refill API")
 app.add_middleware(
     CORSMiddleware,
@@ -138,6 +149,35 @@ def _measure(work, roi):
     }
 
 
+def ita_from_image(bgr, size):
+    """ITA from a single still image, using a centred box of side `size`."""
+    import math
+    H, W = bgr.shape[:2]
+    sz = size if size and size > 0 else min(W, H) // 3
+    half = max(20, min(int(sz), min(W, H)) // 2)
+    cx, cy = W // 2, H // 2
+    rgb = cv2.cvtColor(bgr[cy - half:cy + half, cx - half:cx + half], cv2.COLOR_BGR2RGB).astype(float)
+    if rgb.size == 0:
+        return None
+    keep = ~crt.spec_mask(rgb)
+    sel = rgb[keep] if keep.sum() > 0.2 * keep.size else rgb.reshape(-1, 3)
+    lab = cv2.cvtColor(sel[None, :].astype(np.uint8), cv2.COLOR_RGB2LAB).astype(float).reshape(-1, 3)
+    L = lab[:, 0].mean() * 100 / 255
+    B = lab[:, 2].mean() - 128
+    if abs(B) < 1e-6:
+        return None
+    return round(math.degrees(math.atan((L - 50) / B)), 1)
+
+
+def _photo_frame(bgr, sz):
+    H, W = bgr.shape[:2]
+    half = max(20, min(int(sz), min(W, H)) // 2)
+    disp = bgr.copy()
+    cv2.rectangle(disp, (W // 2 - half, H // 2 - half), (W // 2 + half, H // 2 + half),
+                  (31, 146, 224), max(2, W // 200))  # amber box (BGR)
+    return _jpg_b64(cv2.cvtColor(disp, cv2.COLOR_BGR2RGB))
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -205,6 +245,73 @@ def measure(req: MeasureReq):
     return _measure(work, (cx, cy, size))
 
 
+class ItaReq(BaseModel):
+    clip_id: str
+    cx: int
+    cy: int
+    size: int = 80
+    passcode: str = ""
+
+
+@app.post("/ita")
+def ita(req: ItaReq):
+    """Skin-tone only (no CRT) at a second box — used for the skin-tone reference."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    work = CACHE / f"{req.clip_id}.mp4"
+    if not work.exists():
+        return {"error": "clip not found — please re-upload"}
+    W, H = _dims(work)
+    size = max(40, min(int(req.size), min(W, H)))
+    half = size // 2
+    cx = max(half, min(int(req.cx), W - half))
+    cy = max(half, min(int(req.cy), H - half))
+    val = crt.compute_ita(work, (cx, cy, size))
+    return {"roi": [cx, cy, size], "ita": val, "ita_class": _ita_class(val)}
+
+
+@app.post("/photo")
+async def photo(file: UploadFile = File(...), size: int = Form(0), passcode: str = Form("")):
+    """Skin-tone from a still photo (fallback when the clip doesn't show enough skin)."""
+    if _bad_pass(passcode):
+        return {"error": "wrong passcode"}
+    pid = "p" + uuid.uuid4().hex
+    raw = CACHE / f"{pid}.img"
+    raw.write_bytes(await file.read())
+    bgr = cv2.imread(str(raw))
+    if bgr is None:
+        raw.unlink(missing_ok=True)
+        return {"error": "could not read photo (try a JPEG/PNG)"}
+    H, W = bgr.shape[:2]
+    sz = size if size and size > 0 else min(W, H) // 3
+    val = ita_from_image(bgr, sz)
+    return {"photo_id": pid, "frame": _photo_frame(bgr, sz), "W": W, "H": H,
+            "size": sz, "ita": val, "ita_class": _ita_class(val)}
+
+
+class PhotoItaReq(BaseModel):
+    photo_id: str
+    size: int = 0
+    passcode: str = ""
+
+
+@app.post("/photo_ita")
+def photo_ita(req: PhotoItaReq):
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    raw = CACHE / f"{req.photo_id}.img"
+    if not raw.exists():
+        return {"error": "photo not found — please re-upload"}
+    bgr = cv2.imread(str(raw))
+    if bgr is None:
+        return {"error": "could not read photo"}
+    H, W = bgr.shape[:2]
+    sz = max(40, min(int(req.size) if req.size else min(W, H) // 3, min(W, H)))
+    val = ita_from_image(bgr, sz)
+    return {"frame": _photo_frame(bgr, sz), "W": W, "H": H,
+            "size": sz, "ita": val, "ita_class": _ita_class(val)}
+
+
 class SaveReq(BaseModel):
     clip_id: str
     subject_id: str
@@ -214,6 +321,12 @@ class SaveReq(BaseModel):
     cy: int
     size: int = 80
     notes: str = ""
+    stopwatch: str = ""
+    skin_cx: int = 0
+    skin_cy: int = 0
+    skin_size: int = 0
+    skin_photo_id: str = ""
+    skin_photo_size: int = 0
     passcode: str = ""
 
 
@@ -236,6 +349,31 @@ def save(req: SaveReq):
     cy = max(half, min(int(req.cy), H - half))
     m = _measure(work, (cx, cy, size))
 
+    # skin-tone reference: a photo (preferred if supplied) or a 2nd box on the clip
+    skin_ita, skin_class, skin_source, skin_photo_url = "", "", "", ""
+    if req.skin_photo_id:
+        praw = CACHE / f"{req.skin_photo_id}.img"
+        if praw.exists():
+            pbgr = cv2.imread(str(praw))
+            if pbgr is not None:
+                v = ita_from_image(pbgr, req.skin_photo_size)
+                skin_ita = "" if v is None else v
+                skin_class = _ita_class(v)
+                skin_source = "photo"
+                try:
+                    skin_photo_url = fb_upload_photo(praw, req.clip_id)
+                except Exception:
+                    pass
+    elif int(req.skin_size) > 0:
+        ss = max(40, min(int(req.skin_size), min(W, H)))
+        sh = ss // 2
+        scx = max(sh, min(int(req.skin_cx), W - sh))
+        scy = max(sh, min(int(req.skin_cy), H - sh))
+        v = crt.compute_ita(work, (scx, scy, ss))
+        skin_ita = "" if v is None else v
+        skin_class = _ita_class(v)
+        skin_source = "clip"
+
     if m["crt90"] is None:
         status = "no signal"
     elif m["crt90"] > 3:
@@ -255,9 +393,11 @@ def save(req: SaveReq):
     row = {
         "timestamp": now, "rater": req.rater, "subject_id": req.subject_id, "site": req.site,
         "ita_deg": "" if m["ita"] is None else m["ita"], "ita_class": m["ita_class"],
+        "skintone_ita_deg": skin_ita, "skintone_ita_class": skin_class,
+        "skin_source": skin_source, "skin_photo_url": skin_photo_url,
         "crt90_s": "" if m["crt90"] is None else m["crt90"],
         "crt80_s": "" if m["crt80"] is None else m["crt80"],
-        "crt_stopwatch_a": "", "crt_stopwatch_b": "",
+        "crt_stopwatch_a": req.stopwatch, "crt_stopwatch_b": "",
         "status": status, "quality": m["quality"],
         "span": "" if m["span"] is None else m["span"],
         "fps": "" if m["fps"] is None else m["fps"], "roi_source": "web",
