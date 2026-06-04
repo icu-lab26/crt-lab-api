@@ -80,6 +80,30 @@ def fb_upload_photo(local_path, clip_id):
     return (f"https://firebasestorage.googleapis.com/v0/b/{FB_BUCKET}/o/"
             f"{obj}?alt=media&token={token}")
 
+
+def _dec(v):
+    if "stringValue" in v:
+        return v["stringValue"]
+    if "integerValue" in v:
+        return int(v["integerValue"])
+    if "doubleValue" in v:
+        return float(v["doubleValue"])
+    if "booleanValue" in v:
+        return v["booleanValue"]
+    return ""
+
+
+def fb_list(coll):
+    url = f"{FB_BASE}/{coll}?key={FB_API_KEY}&pageSize=300"
+    r = requests.get(url, timeout=20)
+    r.raise_for_status()
+    out = []
+    for d in r.json().get("documents", []):
+        row = {k: _dec(v) for k, v in d.get("fields", {}).items()}
+        row["_id"] = d["name"].split("/")[-1]
+        out.append(row)
+    return out
+
 app = FastAPI(title="Refill API")
 app.add_middleware(
     CORSMiddleware,
@@ -437,3 +461,60 @@ def save(req: SaveReq):
                 "storage_url": storage_url}
     return {"ok": True, "status": status, "crt90": m["crt90"],
             "storage_url": storage_url, "note": up_note}
+
+
+class ReviewListReq(BaseModel):
+    reviewer: str = ""
+    passcode: str = ""
+
+
+@app.post("/clips")
+def clips(req: ReviewListReq):
+    """List saved clips for blinded review (no algorithm CRT is returned)."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    try:
+        meas = fb_list("measurements")
+        reads = fb_list("readings")
+    except Exception as e:
+        return {"error": f"could not list clips: {e}"}
+    done = {r["_id"] for r in reads if r.get("reviewer") == req.reviewer}
+    items = []
+    for m in meas:
+        cid = m.get("clip_id") or m["_id"]
+        items.append({
+            "clip_id": cid,
+            "subject_id": m.get("subject_id", ""),
+            "site": m.get("site", ""),
+            "storage_url": m.get("storage_url", ""),
+            "reviewed": f"{cid}__{req.reviewer}" in done,
+        })
+    return {"clips": items}
+
+
+class ReadingReq(BaseModel):
+    clip_id: str
+    reviewer: str
+    crt: str = ""
+    cant_assess: bool = False
+    passcode: str = ""
+
+
+@app.post("/reading")
+def reading(req: ReadingReq):
+    """Save a blinded reviewer reading into the readings collection."""
+    if _bad_pass(req.passcode):
+        return {"ok": False, "error": "wrong passcode"}
+    if not req.reviewer:
+        return {"ok": False, "error": "pick a reviewer"}
+    now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    row = {
+        "clip_id": req.clip_id, "reviewer": req.reviewer,
+        "crt_reviewer_s": "" if req.cant_assess else req.crt,
+        "cant_assess": bool(req.cant_assess), "timestamp": now,
+    }
+    try:
+        fb_set("readings", f"{req.clip_id}__{req.reviewer}", row)
+    except Exception as e:
+        return {"ok": False, "error": f"save failed: {e}"}
+    return {"ok": True}
