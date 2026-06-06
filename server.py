@@ -480,6 +480,7 @@ def save(req: SaveReq):
         "status": status, "quality": m["quality"],
         "span": "" if m["span"] is None else m["span"],
         "fps": "" if m["fps"] is None else m["fps"], "roi_source": "web",
+        "roi_cx": cx, "roi_cy": cy, "roi_size": size,
         "notes": req.notes, "clip_id": req.clip_id,
         "storage_url": storage_url, "clip_name": clip_name,
     }
@@ -779,6 +780,113 @@ def reencode(req: ResultsReq):
             raw.unlink(missing_ok=True)
             web.unlink(missing_ok=True)
     return {"ok": True, "fixed": fixed, "failed": failed}
+
+
+def _ensure_cached(clip_id, storage_url):
+    """Make sure the clip is on local disk (download from Storage if needed)."""
+    work = CACHE / f"{clip_id}.mp4"
+    if work.exists():
+        return work
+    if not storage_url:
+        return None
+    rr = requests.get(storage_url, timeout=120)
+    rr.raise_for_status()
+    work.write_bytes(rr.content)
+    return work
+
+
+class CurveSavedReq(BaseModel):
+    clip_id: str
+    passcode: str = ""
+
+
+@app.post("/curve_saved")
+def curve_saved(req: CurveSavedReq):
+    """Regenerate the recovery curve for an already-saved clip (downloads if needed)."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    try:
+        rec = fb_get_doc("measurements", req.clip_id)
+    except Exception as e:
+        return {"error": f"could not load record: {e}"}
+    if not rec:
+        return {"error": "record not found"}
+    try:
+        work = _ensure_cached(req.clip_id, rec.get("storage_url", ""))
+    except Exception as e:
+        return {"error": f"could not fetch clip: {e}"}
+    if work is None or not work.exists():
+        return {"error": "clip file not available"}
+    try:
+        if rec.get("roi_size"):
+            roi = (int(rec["roi_cx"]), int(rec["roi_cy"]), int(rec["roi_size"]))
+        else:
+            roi = crt.auto_roi(work)
+        ts, A, fps = crt.extract_signal(work, roi)
+        r = crt.compute_crt(ts, A)
+        if r is None:
+            return {"error": "no clear refill to plot"}
+        out = CACHE / f"{req.clip_id}_curve.png"
+        crt.plot_result(ts, A, r, out, "Recovery curve")
+        b = base64.b64encode(out.read_bytes()).decode()
+        out.unlink(missing_ok=True)
+        return {"curve": "data:image/png;base64," + b}
+    except Exception as e:
+        return {"error": f"could not plot: {e}"}
+
+
+@app.post("/registry")
+def registry(req: CheckReq):
+    """Full per-clip registry + which reviewers are still pending."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    try:
+        meas = fb_list("measurements")
+        reads = fb_list("readings")
+        cfg = fb_get_doc("readings", "_config_reviewers")
+    except Exception as e:
+        return {"error": f"could not load: {e}"}
+
+    registered = [n for n in [cfg.get("reviewer1", ""), cfg.get("reviewer2", "")] if n and n.strip()]
+    by_clip = {}
+    for r in reads:
+        cid = r.get("clip_id"); rev = r.get("reviewer", "")
+        if not cid or not rev:
+            continue
+        by_clip.setdefault(cid, {})[rev] = {
+            "crt": "" if r.get("cant_assess") else r.get("crt_reviewer_s", ""),
+            "cant": bool(r.get("cant_assess")),
+        }
+
+    rows = []
+    for m in meas:
+        if m.get("_id") == "_config_reviewers":
+            continue
+        cid = m.get("clip_id") or m["_id"]
+        revs = by_clip.get(cid, {})
+        reviewed_by = sorted(revs.keys())
+        missing = [n for n in registered if n not in revs]
+        rows.append({
+            "clip_id": cid,
+            "subject_id": m.get("subject_id", ""),
+            "site": m.get("site", ""),
+            "rater": m.get("rater", ""),
+            "algo_crt90": m.get("crt90_s", ""),
+            "algo_crt80": m.get("crt80_s", ""),
+            "span": m.get("span", ""),
+            "status": m.get("status", ""),
+            "quality": m.get("quality", ""),
+            "skin_class": m.get("skintone_ita_class", "") or m.get("ita_class", ""),
+            "bedside": m.get("crt_stopwatch_a", ""),
+            "storage_url": m.get("storage_url", ""),
+            "has_curve": bool(m.get("storage_url")),
+            "timestamp": m.get("timestamp", ""),
+            "reviews": {rv: revs[rv]["crt"] for rv in revs},
+            "reviewed_by": reviewed_by,
+            "missing": missing,
+        })
+    rows.sort(key=lambda x: (str(x["subject_id"]), str(x["site"])))
+    return {"registered": registered, "rows": rows}
 
 
 # ============================ DELETE A CLIP ============================
