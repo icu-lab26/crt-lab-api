@@ -178,20 +178,42 @@ def _dims(work):
     return W, H
 
 
+def _reliability(crt90, span, quality):
+    """Flag implausible / low-quality auto-measurements (does NOT change the math).
+    Returns (reliable: bool, advice: str)."""
+    if crt90 is None:
+        return False, ("No clear refill detected — the clip likely didn't start while the spot "
+                       "was pressed white. Press until it blanches, START recording, then release.")
+    if crt90 < 0.4:
+        return False, ("Refill looks implausibly fast (under 0.4s) — usually the clip missed the "
+                       "blanch→release. Press until white, start recording, then release.")
+    if crt90 > 8:
+        return False, "Refill looks implausibly slow — check framing/lighting and re-record."
+    if quality and quality != "ok":
+        return False, f"Signal quality flagged: {quality}. Keep the camera and finger still, then re-record."
+    return True, ""
+
+
 def _measure(work, roi):
     ts, A, fps = crt.extract_signal(work, roi)
     r = crt.compute_crt(ts, A)
     ita = crt.compute_ita(work, roi)
     nan = (r is None) or np.isnan(r["crt90"])
+    crt90 = None if nan else round(float(r["crt90"]), 2)
+    span = None if r is None else round(float(r["span"]), 2)
+    quality = "" if r is None else r.get("quality", "")
+    reliable, advice = _reliability(crt90, span, quality)
     return {
         "roi": [int(roi[0]), int(roi[1]), int(roi[2])],
-        "crt90": None if nan else round(float(r["crt90"]), 2),
+        "crt90": crt90,
         "crt80": None if (r is None or np.isnan(r["crt80"])) else round(float(r["crt80"]), 2),
-        "span": None if r is None else round(float(r["span"]), 2),
-        "quality": "" if r is None else r.get("quality", ""),
+        "span": span,
+        "quality": quality,
         "fps": round(float(fps)),
         "ita": ita,
         "ita_class": _ita_class(ita),
+        "reliable": reliable,
+        "advice": advice,
     }
 
 
@@ -479,6 +501,7 @@ def save(req: SaveReq):
         "crt80_s": "" if m["crt80"] is None else m["crt80"],
         "crt_stopwatch_a": req.stopwatch, "crt_stopwatch_b": "",
         "status": status, "quality": m["quality"],
+        "reliable": "yes" if m.get("reliable") else "no",
         "span": "" if m["span"] is None else m["span"],
         "fps": "" if m["fps"] is None else m["fps"], "roi_source": "web",
         "roi_cx": cx, "roi_cy": cy, "roi_size": size,
@@ -909,6 +932,7 @@ def registry(req: CheckReq):
             "span": m.get("span", ""),
             "status": m.get("status", ""),
             "quality": m.get("quality", ""),
+            "reliable": m.get("reliable", ""),
             "skin_class": m.get("skintone_ita_class", "") or m.get("ita_class", ""),
             "bedside": m.get("crt_stopwatch_a", ""),
             "notes": m.get("notes", ""),
