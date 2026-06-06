@@ -318,6 +318,60 @@ def measure(req: MeasureReq):
     return _measure(work, (cx, cy, size))
 
 
+class MeasureRobustReq(BaseModel):
+    clip_id: str
+    cx: int
+    cy: int
+    size: int = 80
+    rcx: int
+    rcy: int
+    rsize: int = 80
+    passcode: str = ""
+
+
+@app.post("/measure_robust")
+def measure_robust_ep(req: MeasureRobustReq):
+    """Experimental: tracked ROI + reference-patch normalization, then the same CRT math."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    work = CACHE / f"{req.clip_id}.mp4"
+    if not work.exists():
+        return {"error": "clip not found — please re-upload"}
+    import crt_robust
+    W, H = _dims(work)
+
+    def clamp(cx, cy, size):
+        size = max(40, min(int(size), min(W, H)))
+        h = size // 2
+        return max(h, min(int(cx), W - h)), max(h, min(int(cy), H - h)), size
+
+    box = clamp(req.cx, req.cy, req.size)
+    ref = clamp(req.rcx, req.rcy, req.rsize)
+    try:
+        res = crt_robust.measure_robust(work, box, ref)
+    except Exception as e:
+        return {"error": f"robust failed: {e}"}
+    if res is None:
+        return {"error": "could not read clip"}
+    r = res["r"]
+    crt90 = None if (r is None or np.isnan(r["crt90"])) else round(float(r["crt90"]), 2)
+    crt80 = None if (r is None or np.isnan(r["crt80"])) else round(float(r["crt80"]), 2)
+    span = None if r is None else round(float(r["span"]), 2)
+    quality = "" if r is None else r.get("quality", "")
+    reliable, advice = _reliability(crt90, span, quality)
+    curve = ""
+    try:
+        out = CACHE / f"{req.clip_id}_robust.png"
+        crt.plot_result(res["ts"], res["Anorm"], r, out, "Robust (tracked + normalized)")
+        curve = "data:image/png;base64," + base64.b64encode(out.read_bytes()).decode()
+        out.unlink(missing_ok=True)
+    except Exception:
+        pass
+    return {"crt90": crt90, "crt80": crt80, "span": span, "quality": quality,
+            "track_disp": round(res["track_disp"], 1), "track_max": round(res["track_max"], 1),
+            "reliable": reliable, "advice": advice, "curve": curve}
+
+
 class ItaReq(BaseModel):
     clip_id: str
     cx: int
