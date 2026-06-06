@@ -540,6 +540,24 @@ def save(req: SaveReq):
     else:
         status = "normal"
 
+    # robust (experimental): tracked CRT box normalized by the clip skin box as reference
+    crt90_robust, crt80_robust, robust_disp = "", "", ""
+    rscx = rscy = rss = 0
+    if int(req.skin_size) > 0:
+        rss = max(40, min(int(req.skin_size), min(W, H)))
+        rh = rss // 2
+        rscx = max(rh, min(int(req.skin_cx), W - rh))
+        rscy = max(rh, min(int(req.skin_cy), H - rh))
+        try:
+            import crt_robust
+            rr = crt_robust.measure_robust(work, (cx, cy, size), (rscx, rscy, rss))
+            if rr and rr["r"] is not None and not np.isnan(rr["r"]["crt90"]):
+                crt90_robust = round(float(rr["r"]["crt90"]), 2)
+                crt80_robust = "" if np.isnan(rr["r"]["crt80"]) else round(float(rr["r"]["crt80"]), 2)
+                robust_disp = round(float(rr["track_max"]), 1)
+        except Exception:
+            pass
+
     storage_url, up_note = "", ""
     play = CACHE / f"{req.clip_id}_web.mp4"
     try:
@@ -570,6 +588,9 @@ def save(req: SaveReq):
         "span": "" if m["span"] is None else m["span"],
         "fps": "" if m["fps"] is None else m["fps"], "roi_source": "web",
         "roi_cx": cx, "roi_cy": cy, "roi_size": size,
+        "crt90_robust_s": crt90_robust, "crt80_robust_s": crt80_robust,
+        "robust_track_px": robust_disp,
+        "skin_cx": rscx, "skin_cy": rscy, "skin_size": rss,
         "notes": req.notes, "clip_id": req.clip_id,
         "storage_url": storage_url, "clip_name": clip_name,
     }
@@ -770,6 +791,7 @@ def results(req: ResultsReq):
             "site": m.get("site", ""),
             "skin_class": m.get("skintone_ita_class", ""),
             "algo_crt": _f(m.get("crt90_s")),
+            "algo_crt_robust": _f(m.get("crt90_robust_s")),
             "bedside": _f(m.get("crt_stopwatch_a")),
             "reviews": {rv: by_clip.get(cid, {}).get(rv) for rv in reviewers},
             "n_reviews": sum(1 for rv in reviewers if by_clip.get(cid, {}).get(rv) is not None),
@@ -840,18 +862,30 @@ def results(req: ResultsReq):
 
     # consensus (mean of the reviewers on clips both/all read) vs algorithm
     consensus_algo = None
+    consensus_robust = None
     CC, CA = [], []
     for m in meas:
         cid = m.get("clip_id") or m["_id"]
         algo = _f(m.get("crt90_s"))
-        if algo is None:
+        vals = [by_clip.get(cid, {}).get(rv) for rv in reviewers]
+        vals = [v for v in vals if v is not None]
+        if len(vals) >= 2 and algo is not None:
+            CC.append(sum(vals) / len(vals)); CA.append(algo)
+    # build robust-vs-consensus pairs separately (clip-aligned)
+    rc_pairs = []
+    for m in meas:
+        cid = m.get("clip_id") or m["_id"]
+        rob = _f(m.get("crt90_robust_s"))
+        if rob is None:
             continue
         vals = [by_clip.get(cid, {}).get(rv) for rv in reviewers]
         vals = [v for v in vals if v is not None]
         if len(vals) >= 2:
-            CC.append(sum(vals) / len(vals)); CA.append(algo)
+            rc_pairs.append((sum(vals) / len(vals), rob))
     if CC:
         consensus_algo = _agree(CC, CA)
+    if rc_pairs:
+        consensus_robust = _agree([p[0] for p in rc_pairs], [p[1] for p in rc_pairs])
 
     summary = {
         "n_clips": len(meas),
@@ -864,6 +898,7 @@ def results(req: ResultsReq):
         "bedside_vs_algo": bed_algo,
         "per_reviewer_vs_algo": per_reviewer,
         "consensus_vs_algo": consensus_algo,
+        "consensus_vs_robust": consensus_robust,
     }
     return {"reviewers": reviewers, "rows": rows, "summary": summary}
 
