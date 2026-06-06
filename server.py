@@ -677,6 +677,8 @@ class SaveReq(BaseModel):
     skin_size: int = 0
     skin_photo_id: str = ""
     skin_photo_size: int = 0
+    room_temp_c: str = ""
+    patient_temp_c: str = ""
     passcode: str = ""
 
 
@@ -769,6 +771,8 @@ def save(req: SaveReq):
         "crt80_s": "" if m["crt80"] is None else m["crt80"],
         "crt_peak_s": "" if m.get("crt_peak") is None else m["crt_peak"],
         "crt_full_s": "" if m.get("crt_full") is None else m["crt_full"],
+        "room_temp_c": str(req.room_temp_c).strip(),
+        "patient_temp_c": str(req.patient_temp_c).strip(),
         "crt_stopwatch_a": req.stopwatch, "crt_stopwatch_b": "",
         "status": status, "quality": m["quality"],
         "reliable": "yes" if m.get("reliable") else "no",
@@ -815,6 +819,7 @@ def clips(req: ReviewListReq):
             "site": m.get("site", ""),
             "storage_url": m.get("storage_url", ""),
             "reviewed": f"{cid}__{req.reviewer}" in done,
+            "reviewed_rep": f"{cid}__{req.reviewer}__rep" in done,
         })
     return {"clips": items}
 
@@ -824,24 +829,28 @@ class ReadingReq(BaseModel):
     reviewer: str
     crt: str = ""
     cant_assess: bool = False
+    pass_n: int = 1
     passcode: str = ""
 
 
 @app.post("/reading")
 def reading(req: ReadingReq):
-    """Save a blinded reviewer reading into the readings collection."""
+    """Save a blinded reviewer reading. pass_n=2 stores a hidden re-read (self-consistency)."""
     if _bad_pass(req.passcode):
         return {"ok": False, "error": "wrong passcode"}
     if not req.reviewer:
         return {"ok": False, "error": "pick a reviewer"}
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    is_rep = int(req.pass_n) == 2
     row = {
         "clip_id": req.clip_id, "reviewer": req.reviewer,
         "crt_reviewer_s": "" if req.cant_assess else req.crt,
         "cant_assess": bool(req.cant_assess), "timestamp": now,
+        "pass": 2 if is_rep else 1, "repeat": is_rep,
     }
+    doc_id = f"{req.clip_id}__{req.reviewer}__rep" if is_rep else f"{req.clip_id}__{req.reviewer}"
     try:
-        fb_set("readings", f"{req.clip_id}__{req.reviewer}", row)
+        fb_set("readings", doc_id, row)
     except Exception as e:
         return {"ok": False, "error": f"save failed: {e}"}
     return {"ok": True}
@@ -940,6 +949,40 @@ def _kappa(a, b):
     return round(float((po - pe) / (1 - pe)), 3)
 
 
+def _cat3(v):
+    """fast (<2s) / normal (2-3s) / slow (>3s)."""
+    if v is None:
+        return None
+    if v < 2:
+        return "fast"
+    if v <= 3:
+        return "normal"
+    return "slow"
+
+
+def _fleiss_kappa(rows):
+    """rows = list of per-item category-count dicts over a fixed label set.
+    Each item must have the same total number of ratings. Returns kappa or None."""
+    cats = ["fast", "normal", "slow"]
+    rows = [r for r in rows if sum(r.get(c, 0) for c in cats) >= 2]
+    if len(rows) < 2:
+        return None
+    n_per = [sum(r.get(c, 0) for c in cats) for r in rows]
+    if len(set(n_per)) != 1:
+        return None  # Fleiss needs equal ratings per item
+    n = n_per[0]
+    if n < 2:
+        return None
+    N = len(rows)
+    p_j = {c: sum(r.get(c, 0) for r in rows) / (N * n) for c in cats}
+    P_i = [(sum(r.get(c, 0) ** 2 for c in cats) - n) / (n * (n - 1)) for r in rows]
+    P_bar = sum(P_i) / N
+    P_e = sum(v ** 2 for v in p_j.values())
+    if P_e >= 1:
+        return 1.0
+    return round((P_bar - P_e) / (1 - P_e), 3)
+
+
 class ResultsReq(BaseModel):
     passcode: str = ""
 
@@ -958,14 +1001,19 @@ def results(req: ResultsReq):
     import itertools
     THR = 3.0
     by_clip = {}
+    repeats = {}          # reviewer -> clip_id -> pass-2 value
     reviewers = set()
     for r in reads:
         cid = r.get("clip_id")
         rev = r.get("reviewer", "")
         if not cid or not rev:
             continue
-        reviewers.add(rev)
         val = None if r.get("cant_assess") else _f(r.get("crt_reviewer_s"))
+        is_rep = bool(r.get("repeat")) or str(r.get("_id", "")).endswith("__rep")
+        if is_rep:
+            repeats.setdefault(rev, {})[cid] = val
+            continue
+        reviewers.add(rev)
         by_clip.setdefault(cid, {})[rev] = val
     reviewers = sorted(reviewers)
     tones = _skintone_map()
@@ -984,6 +1032,8 @@ def results(req: ResultsReq):
             "algo_crt_robust": _f(m.get("crt90_robust_s")),
             "algo_crt_peak": _f(m.get("crt_peak_s")),
             "algo_crt_full": _f(m.get("crt_full_s")),
+            "room_temp_c": m.get("room_temp_c", ""),
+            "patient_temp_c": m.get("patient_temp_c", ""),
             "bedside": _f(m.get("crt_stopwatch_a")),
             "reviews": {rv: by_clip.get(cid, {}).get(rv) for rv in reviewers},
             "n_reviews": sum(1 for rv in reviewers if by_clip.get(cid, {}).get(rv) is not None),
@@ -1073,6 +1123,33 @@ def results(req: ResultsReq):
     consensus_peak = _consensus_vs("crt_peak_s")
     consensus_full = _consensus_vs("crt_full_s")
 
+    # intra-rater self-consistency: pass-1 vs hidden pass-2 (repeat) readings
+    intrarater = {}
+    pooled_d1, pooled_d2 = [], []
+    for rev in reviewers:
+        reps = repeats.get(rev, {})
+        v1, v2 = [], []
+        for cid, r2 in reps.items():
+            r1 = by_clip.get(cid, {}).get(rev)
+            if r1 is not None and r2 is not None:
+                v1.append(r1); v2.append(r2)
+        if v1:
+            ag = _agree(v1, v2)
+            cat1 = [_cat3(x) for x in v1]; cat2 = [_cat3(x) for x in v2]
+            ag["category_agreement"] = round(float(np.mean([a == b for a, b in zip(cat1, cat2)])), 3)
+            intrarater[rev] = ag
+            pooled_d1 += v1; pooled_d2 += v2
+    intrarater_pooled = _agree(pooled_d1, pooled_d2) if pooled_d1 else None
+
+    # fast/normal/slow agreement across reviewers (Fleiss' kappa)
+    cat_rows = []
+    for cid, revs in by_clip.items():
+        cats = [_cat3(v) for v in revs.values() if v is not None]
+        if len(cats) >= 2:
+            cat_rows.append({c: cats.count(c) for c in ["fast", "normal", "slow"]})
+    category_fleiss = _fleiss_kappa(cat_rows)
+    category_n = len(cat_rows)
+
     summary = {
         "n_clips": len(meas),
         "n_with_algo": sum(1 for m in meas if _f(m.get("crt90_s")) is not None),
@@ -1087,6 +1164,10 @@ def results(req: ResultsReq):
         "consensus_vs_robust": consensus_robust,
         "consensus_vs_peak": consensus_peak,
         "consensus_vs_full": consensus_full,
+        "intrarater": intrarater,
+        "intrarater_pooled": intrarater_pooled,
+        "category_fleiss": category_fleiss,
+        "category_n": category_n,
     }
     return {"reviewers": reviewers, "rows": rows, "summary": summary}
 
