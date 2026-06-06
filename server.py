@@ -17,6 +17,7 @@ import tempfile
 import urllib.parse
 import uuid
 from pathlib import Path
+from typing import Optional
 
 import cv2
 import numpy as np
@@ -878,6 +879,7 @@ def registry(req: CheckReq):
             "quality": m.get("quality", ""),
             "skin_class": m.get("skintone_ita_class", "") or m.get("ita_class", ""),
             "bedside": m.get("crt_stopwatch_a", ""),
+            "notes": m.get("notes", ""),
             "storage_url": m.get("storage_url", ""),
             "has_curve": bool(m.get("storage_url")),
             "timestamp": m.get("timestamp", ""),
@@ -887,6 +889,45 @@ def registry(req: CheckReq):
         })
     rows.sort(key=lambda x: (str(x["subject_id"]), str(x["site"])))
     return {"registered": registered, "rows": rows}
+
+
+# ============================ EDIT A CLIP ============================
+class EditReq(BaseModel):
+    clip_id: str
+    subject_id: Optional[str] = None
+    site: Optional[str] = None
+    rater: Optional[str] = None
+    notes: Optional[str] = None
+    bedside: Optional[str] = None
+    passcode: str = ""
+
+
+@app.post("/edit")
+def edit_clip(req: EditReq):
+    """Edit human-entered fields of a saved record (subject, site, rater, bedside, notes)."""
+    if _bad_pass(req.passcode):
+        return {"ok": False, "error": "wrong passcode"}
+    try:
+        m = fb_get_doc("measurements", req.clip_id)
+    except Exception as e:
+        return {"ok": False, "error": f"load failed: {e}"}
+    if not m:
+        return {"ok": False, "error": "record not found"}
+    if req.subject_id is not None:
+        m["subject_id"] = req.subject_id.strip()
+    if req.site is not None:
+        m["site"] = req.site.strip()
+    if req.rater is not None:
+        m["rater"] = req.rater.strip()
+    if req.notes is not None:
+        m["notes"] = req.notes
+    if req.bedside is not None:
+        m["crt_stopwatch_a"] = req.bedside.strip()
+    try:
+        fb_set("measurements", req.clip_id, m)
+    except Exception as e:
+        return {"ok": False, "error": f"save failed: {e}"}
+    return {"ok": True}
 
 
 # ============================ DELETE A CLIP ============================
