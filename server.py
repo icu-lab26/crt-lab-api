@@ -735,6 +735,36 @@ def results(req: ResultsReq):
     if BB:
         bed_algo = _agree(BB, BA)
 
+    # each reviewer separately vs algorithm
+    per_reviewer = {}
+    for rv in reviewers:
+        rr, aa = [], []
+        for m in meas:
+            cid = m.get("clip_id") or m["_id"]
+            algo = _f(m.get("crt90_s"))
+            if algo is None:
+                continue
+            v = by_clip.get(cid, {}).get(rv)
+            if v is not None:
+                rr.append(v); aa.append(algo)
+        if rr:
+            per_reviewer[rv] = _agree(rr, aa)
+
+    # consensus (mean of the reviewers on clips both/all read) vs algorithm
+    consensus_algo = None
+    CC, CA = [], []
+    for m in meas:
+        cid = m.get("clip_id") or m["_id"]
+        algo = _f(m.get("crt90_s"))
+        if algo is None:
+            continue
+        vals = [by_clip.get(cid, {}).get(rv) for rv in reviewers]
+        vals = [v for v in vals if v is not None]
+        if len(vals) >= 2:
+            CC.append(sum(vals) / len(vals)); CA.append(algo)
+    if CC:
+        consensus_algo = _agree(CC, CA)
+
     summary = {
         "n_clips": len(meas),
         "n_with_algo": sum(1 for m in meas if _f(m.get("crt90_s")) is not None),
@@ -744,6 +774,8 @@ def results(req: ResultsReq):
         "interrater": interrater,
         "reviewer_vs_algo": rev_algo,
         "bedside_vs_algo": bed_algo,
+        "per_reviewer_vs_algo": per_reviewer,
+        "consensus_vs_algo": consensus_algo,
     }
     return {"reviewers": reviewers, "rows": rows, "summary": summary}
 
@@ -977,3 +1009,30 @@ def delete_clip(req: DeleteReq):
     except Exception as e:
         notes.append(f"readings: {e}")
     return {"ok": True, "note": "; ".join(notes)}
+
+
+class DeleteReviewerReq(BaseModel):
+    reviewer: str
+    passcode: str = ""
+
+
+@app.post("/delete_reviewer")
+def delete_reviewer(req: DeleteReviewerReq):
+    """Delete all readings made by one reviewer name (e.g. a test entry)."""
+    if _bad_pass(req.passcode):
+        return {"ok": False, "error": "wrong passcode"}
+    if not req.reviewer:
+        return {"ok": False, "error": "no reviewer"}
+    try:
+        reads = fb_list("readings")
+    except Exception as e:
+        return {"ok": False, "error": f"list failed: {e}"}
+    n = 0
+    for r in reads:
+        if r.get("reviewer") == req.reviewer:
+            try:
+                fb_delete("readings", r["_id"])
+                n += 1
+            except Exception:
+                pass
+    return {"ok": True, "deleted": n}
