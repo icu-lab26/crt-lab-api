@@ -464,6 +464,174 @@ def photo_ita(req: PhotoItaReq):
             "size": sz, "ita": val, "ita_class": _ita_class(val)}
 
 
+def _safe_id(s):
+    return "".join(c if c.isalnum() else "_" for c in str(s).strip()) or "unknown"
+
+
+def ita_at_box(bgr, cx, cy, size):
+    """ITA from a still image, using a box of side `size` centred at (cx, cy)."""
+    import math
+    H, W = bgr.shape[:2]
+    half = max(20, min(int(size), min(W, H)) // 2)
+    cx = max(half, min(int(cx), W - half))
+    cy = max(half, min(int(cy), H - half))
+    rgb = cv2.cvtColor(bgr[cy - half:cy + half, cx - half:cx + half], cv2.COLOR_BGR2RGB).astype(float)
+    if rgb.size == 0:
+        return None
+    keep = ~crt.spec_mask(rgb)
+    sel = rgb[keep] if keep.sum() > 0.2 * keep.size else rgb.reshape(-1, 3)
+    lab = cv2.cvtColor(sel[None, :].astype(np.uint8), cv2.COLOR_RGB2LAB).astype(float).reshape(-1, 3)
+    L = lab[:, 0].mean() * 100 / 255
+    B = lab[:, 2].mean() - 128
+    if abs(B) < 1e-6:
+        return None
+    return round(math.degrees(math.atan((L - 50) / B)), 1)
+
+
+def _skintone_map():
+    """subject_id -> {ita, ita_class, source} from the skintone collection."""
+    out = {}
+    try:
+        for d in fb_list("skintone"):
+            sid = d.get("subject_id") or d["_id"]
+            out[str(sid)] = {"ita": d.get("ita", ""), "ita_class": d.get("ita_class", ""),
+                             "source": d.get("source", "")}
+    except Exception:
+        pass
+    return out
+
+
+class SkinSubjectsReq(BaseModel):
+    passcode: str = ""
+
+
+@app.post("/skin_subjects")
+def skin_subjects(req: SkinSubjectsReq):
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    try:
+        meas = fb_list("measurements")
+    except Exception as e:
+        return {"error": str(e)}
+    tones = _skintone_map()
+    subs = {}
+    for m in meas:
+        sid = str(m.get("subject_id", "")).strip()
+        if not sid:
+            continue
+        s = subs.setdefault(sid, {"sites": set(), "has_clip": False})
+        s["sites"].add(m.get("site", ""))
+        if m.get("storage_url"):
+            s["has_clip"] = True
+    rows = []
+    for sid, s in sorted(subs.items()):
+        t = tones.get(sid, {})
+        rows.append({"subject_id": sid, "sites": sorted([x for x in s["sites"] if x]),
+                     "has_clip": s["has_clip"], "ita": t.get("ita", ""),
+                     "ita_class": t.get("ita_class", "")})
+    return {"subjects": rows}
+
+
+class SubjectFrameReq(BaseModel):
+    subject_id: str
+    passcode: str = ""
+
+
+@app.post("/subject_frame")
+def subject_frame(req: SubjectFrameReq):
+    """Grab a still frame from one of the subject's clips (prefers a finger clip = real skin)."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    try:
+        meas = fb_list("measurements")
+    except Exception as e:
+        return {"error": str(e)}
+    clips = [m for m in meas if str(m.get("subject_id", "")).strip() == str(req.subject_id).strip()
+             and m.get("storage_url")]
+    if not clips:
+        return {"error": "no stored clip for this subject — upload a photo instead"}
+    clips.sort(key=lambda m: 0 if m.get("site") == "finger" else 1)  # prefer finger (skin)
+    m = clips[0]
+    cid = m.get("clip_id") or m["_id"]
+    try:
+        work = _ensure_cached(cid, m.get("storage_url", ""))
+        if work is None:
+            return {"error": "could not load the clip"}
+        rgb = _frame_at_sec(work, 0.1)
+        if rgb is None:
+            return {"error": "could not read a frame"}
+    except Exception as e:
+        return {"error": f"frame failed: {e}"}
+    H, W = rgb.shape[:2]
+    key = "skf_" + _safe_id(req.subject_id)
+    cv2.imwrite(str(CACHE / f"{key}.png"), cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR))
+    return {"key": key, "frame": _jpg_b64(rgb), "W": W, "H": H, "clip_id": cid, "site": m.get("site", "")}
+
+
+class SkinItaReq(BaseModel):
+    key: str
+    cx: int
+    cy: int
+    size: int = 120
+    passcode: str = ""
+
+
+@app.post("/skin_ita")
+def skin_ita(req: SkinItaReq):
+    """ITA at an arbitrary box on a cached image (a grabbed frame skf_*.png or a photo *.img)."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    for cand in (CACHE / f"{req.key}.png", CACHE / f"{req.key}.img"):
+        if cand.exists():
+            bgr = cv2.imread(str(cand))
+            if bgr is None:
+                return {"error": "could not read image"}
+            val = ita_at_box(bgr, req.cx, req.cy, req.size)
+            return {"ita": "" if val is None else val, "ita_class": _ita_class(val)}
+    return {"error": "image expired — re-grab the frame or re-upload the photo"}
+
+
+class SkinToneSetReq(BaseModel):
+    subject_id: str
+    ita: float | None = None
+    ita_class: str = ""
+    source: str = ""
+    passcode: str = ""
+
+
+@app.post("/skintone_set")
+def skintone_set(req: SkinToneSetReq):
+    if _bad_pass(req.passcode):
+        return {"ok": False, "error": "wrong passcode"}
+    sid = str(req.subject_id).strip()
+    if not sid:
+        return {"ok": False, "error": "enter a subject ID"}
+    try:
+        fb_set("skintone", _safe_id(sid),
+               {"subject_id": sid, "ita": req.ita if req.ita is not None else "",
+                "ita_class": req.ita_class, "source": req.source,
+                "ts": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")})
+    except Exception as e:
+        return {"ok": False, "error": str(e)}
+    return {"ok": True}
+
+
+@app.post("/skin_photo")
+async def skin_photo(file: UploadFile = File(...), passcode: str = Form("")):
+    """Upload a photo for skin tone; returns a clean frame + a key for /skin_ita."""
+    if _bad_pass(passcode):
+        return {"error": "wrong passcode"}
+    pid = "p" + uuid.uuid4().hex
+    raw = CACHE / f"{pid}.img"
+    raw.write_bytes(await file.read())
+    bgr = cv2.imread(str(raw))
+    if bgr is None:
+        raw.unlink(missing_ok=True)
+        return {"error": "could not read photo (try a JPEG/PNG)"}
+    H, W = bgr.shape[:2]
+    return {"key": pid, "frame": _jpg_b64(cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)), "W": W, "H": H}
+
+
 class SaveReq(BaseModel):
     clip_id: str
     subject_id: str
@@ -768,15 +936,18 @@ def results(req: ResultsReq):
         val = None if r.get("cant_assess") else _f(r.get("crt_reviewer_s"))
         by_clip.setdefault(cid, {})[rev] = val
     reviewers = sorted(reviewers)
+    tones = _skintone_map()
 
     rows = []
     for m in meas:
         cid = m.get("clip_id") or m["_id"]
+        sid = str(m.get("subject_id", ""))
+        subj_tone = tones.get(sid, {})
         rows.append({
             "clip_id": cid,
             "subject_id": m.get("subject_id", ""),
             "site": m.get("site", ""),
-            "skin_class": m.get("skintone_ita_class", ""),
+            "skin_class": subj_tone.get("ita_class") or m.get("skintone_ita_class", ""),
             "algo_crt": _f(m.get("crt90_s")),
             "algo_crt_robust": _f(m.get("crt90_robust_s")),
             "bedside": _f(m.get("crt_stopwatch_a")),
@@ -1002,6 +1173,7 @@ def registry(req: CheckReq):
         }
 
     rows = []
+    tones = _skintone_map()
     for m in meas:
         if m.get("_id") == "_config_reviewers":
             continue
@@ -1009,6 +1181,7 @@ def registry(req: CheckReq):
         revs = by_clip.get(cid, {})
         reviewed_by = sorted(revs.keys())
         missing = [n for n in registered if n not in revs]
+        subj_tone = tones.get(str(m.get("subject_id", "")), {})
         rows.append({
             "clip_id": cid,
             "subject_id": m.get("subject_id", ""),
@@ -1020,7 +1193,7 @@ def registry(req: CheckReq):
             "status": m.get("status", ""),
             "quality": m.get("quality", ""),
             "reliable": m.get("reliable", ""),
-            "skin_class": m.get("skintone_ita_class", "") or m.get("ita_class", ""),
+            "skin_class": subj_tone.get("ita_class") or m.get("skintone_ita_class", "") or m.get("ita_class", ""),
             "bedside": m.get("crt_stopwatch_a", ""),
             "notes": m.get("notes", ""),
             "storage_url": m.get("storage_url", ""),
