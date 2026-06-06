@@ -203,10 +203,40 @@ def _measure(work, roi):
     span = None if r is None else round(float(r["span"]), 2)
     quality = "" if r is None else r.get("quality", "")
     reliable, advice = _reliability(crt90, span, quality)
+    # extra endpoints off the SAME curve (crt.py untouched): peak = time to maximum
+    # redness ("how the eye counts"); full = time to reach the recovered plateau.
+    peak_s = full_s = None
+    try:
+        if r is not None and r.get("span", 0) and r["span"] >= 0.5:
+            As = np.asarray(r["As"], float); bi = int(r["bi"])
+            blanch = float(r["blanch"]); spanv = float(r["span"])
+            fpsv = len(As) / max(ts[-1], 1e-3)
+            hi = min(len(As), bi + int(6.0 * fpsv))
+            window = As[bi:hi]; tt = np.asarray(ts[bi:hi], float) - float(ts[bi])
+            if len(window) >= 5:
+                def _cross(p, frx):
+                    idx = np.where(frx >= p)[0]
+                    if not len(idx):
+                        return None
+                    j = int(idx[0])
+                    if j == 0:
+                        return 0.0
+                    return float(tt[j - 1] + (p - frx[j - 1]) * (tt[j] - tt[j - 1]) / (frx[j] - frx[j - 1]))
+                fr = (window - blanch) / spanv
+                fv = _cross(0.99, fr)
+                full_s = None if fv is None else round(fv, 2)
+                peakval = float(window.max()); pspan = peakval - blanch
+                if pspan > 1e-6:
+                    pv = _cross(0.95, (window - blanch) / pspan)
+                    peak_s = None if pv is None else round(pv, 2)
+    except Exception:
+        pass
     return {
         "roi": [int(roi[0]), int(roi[1]), int(roi[2])],
         "crt90": crt90,
         "crt80": None if (r is None or np.isnan(r["crt80"])) else round(float(r["crt80"]), 2),
+        "crt_peak": peak_s,
+        "crt_full": full_s,
         "span": span,
         "quality": quality,
         "fps": round(float(fps)),
@@ -737,6 +767,8 @@ def save(req: SaveReq):
         "skin_source": skin_source, "skin_photo_url": skin_photo_url,
         "crt90_s": "" if m["crt90"] is None else m["crt90"],
         "crt80_s": "" if m["crt80"] is None else m["crt80"],
+        "crt_peak_s": "" if m.get("crt_peak") is None else m["crt_peak"],
+        "crt_full_s": "" if m.get("crt_full") is None else m["crt_full"],
         "crt_stopwatch_a": req.stopwatch, "crt_stopwatch_b": "",
         "status": status, "quality": m["quality"],
         "reliable": "yes" if m.get("reliable") else "no",
@@ -950,6 +982,8 @@ def results(req: ResultsReq):
             "skin_class": subj_tone.get("ita_class") or m.get("skintone_ita_class", ""),
             "algo_crt": _f(m.get("crt90_s")),
             "algo_crt_robust": _f(m.get("crt90_robust_s")),
+            "algo_crt_peak": _f(m.get("crt_peak_s")),
+            "algo_crt_full": _f(m.get("crt_full_s")),
             "bedside": _f(m.get("crt_stopwatch_a")),
             "reviews": {rv: by_clip.get(cid, {}).get(rv) for rv in reviewers},
             "n_reviews": sum(1 for rv in reviewers if by_clip.get(cid, {}).get(rv) is not None),
@@ -1018,32 +1052,26 @@ def results(req: ResultsReq):
         if rr:
             per_reviewer[rv] = _agree(rr, aa)
 
-    # consensus (mean of the reviewers on clips both/all read) vs algorithm
-    consensus_algo = None
-    consensus_robust = None
-    CC, CA = [], []
-    for m in meas:
-        cid = m.get("clip_id") or m["_id"]
-        algo = _f(m.get("crt90_s"))
-        vals = [by_clip.get(cid, {}).get(rv) for rv in reviewers]
-        vals = [v for v in vals if v is not None]
-        if len(vals) >= 2 and algo is not None:
-            CC.append(sum(vals) / len(vals)); CA.append(algo)
-    # build robust-vs-consensus pairs separately (clip-aligned)
-    rc_pairs = []
-    for m in meas:
-        cid = m.get("clip_id") or m["_id"]
-        rob = _f(m.get("crt90_robust_s"))
-        if rob is None:
-            continue
-        vals = [by_clip.get(cid, {}).get(rv) for rv in reviewers]
-        vals = [v for v in vals if v is not None]
-        if len(vals) >= 2:
-            rc_pairs.append((sum(vals) / len(vals), rob))
-    if CC:
-        consensus_algo = _agree(CC, CA)
-    if rc_pairs:
-        consensus_robust = _agree([p[0] for p in rc_pairs], [p[1] for p in rc_pairs])
+    # consensus (mean of reviewers on clips with >=2 readings) vs each algorithm endpoint
+    def _consensus_vs(field):
+        pairs = []
+        for m in meas:
+            cid = m.get("clip_id") or m["_id"]
+            val = _f(m.get(field))
+            if val is None:
+                continue
+            vals = [by_clip.get(cid, {}).get(rv) for rv in reviewers]
+            vals = [v for v in vals if v is not None]
+            if len(vals) >= 2:
+                pairs.append((sum(vals) / len(vals), val))
+        if not pairs:
+            return None
+        return _agree([p[0] for p in pairs], [p[1] for p in pairs])
+
+    consensus_algo = _consensus_vs("crt90_s")
+    consensus_robust = _consensus_vs("crt90_robust_s")
+    consensus_peak = _consensus_vs("crt_peak_s")
+    consensus_full = _consensus_vs("crt_full_s")
 
     summary = {
         "n_clips": len(meas),
@@ -1057,6 +1085,8 @@ def results(req: ResultsReq):
         "per_reviewer_vs_algo": per_reviewer,
         "consensus_vs_algo": consensus_algo,
         "consensus_vs_robust": consensus_robust,
+        "consensus_vs_peak": consensus_peak,
+        "consensus_vs_full": consensus_full,
     }
     return {"reviewers": reviewers, "rows": rows, "summary": summary}
 
