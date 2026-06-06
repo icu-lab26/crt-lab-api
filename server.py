@@ -960,7 +960,8 @@ def delete_clip(req: DeleteReq):
     try:
         fb_delete("measurements", req.clip_id)
     except Exception as e:
-        notes.append(f"record: {e}")
+        return {"ok": False,
+                "error": f"delete blocked — check that Firestore rules allow delete: {e}"}
     for obj in (f"clips/{req.clip_id}.mp4", f"clips/{req.clip_id}_skin.jpg"):
         try:
             fb_delete_object(obj)
