@@ -323,15 +323,12 @@ class MeasureRobustReq(BaseModel):
     cx: int
     cy: int
     size: int = 80
-    rcx: int
-    rcy: int
-    rsize: int = 80
     passcode: str = ""
 
 
 @app.post("/measure_robust")
 def measure_robust_ep(req: MeasureRobustReq):
-    """Experimental: tracked ROI + reference-patch normalization, then the same CRT math."""
+    """Experimental: tracked ROI + exposure normalization, then the same CRT math."""
     if _bad_pass(req.passcode):
         return {"error": "wrong passcode"}
     work = CACHE / f"{req.clip_id}.mp4"
@@ -339,16 +336,12 @@ def measure_robust_ep(req: MeasureRobustReq):
         return {"error": "clip not found — please re-upload"}
     import crt_robust
     W, H = _dims(work)
-
-    def clamp(cx, cy, size):
-        size = max(40, min(int(size), min(W, H)))
-        h = size // 2
-        return max(h, min(int(cx), W - h)), max(h, min(int(cy), H - h)), size
-
-    box = clamp(req.cx, req.cy, req.size)
-    ref = clamp(req.rcx, req.rcy, req.rsize)
+    size = max(40, min(int(req.size), min(W, H)))
+    h = size // 2
+    cx = max(h, min(int(req.cx), W - h))
+    cy = max(h, min(int(req.cy), H - h))
     try:
-        res = crt_robust.measure_robust(work, box, ref)
+        res = crt_robust.measure_robust(work, (cx, cy, size))
     except Exception as e:
         return {"error": f"robust failed: {e}"}
     if res is None:
@@ -540,23 +533,17 @@ def save(req: SaveReq):
     else:
         status = "normal"
 
-    # robust (experimental): tracked CRT box normalized by the clip skin box as reference
+    # robust (experimental): tracked CRT box + exposure normalization (skin box NOT used)
     crt90_robust, crt80_robust, robust_disp = "", "", ""
-    rscx = rscy = rss = 0
-    if int(req.skin_size) > 0:
-        rss = max(40, min(int(req.skin_size), min(W, H)))
-        rh = rss // 2
-        rscx = max(rh, min(int(req.skin_cx), W - rh))
-        rscy = max(rh, min(int(req.skin_cy), H - rh))
-        try:
-            import crt_robust
-            rr = crt_robust.measure_robust(work, (cx, cy, size), (rscx, rscy, rss))
-            if rr and rr["r"] is not None and not np.isnan(rr["r"]["crt90"]):
-                crt90_robust = round(float(rr["r"]["crt90"]), 2)
-                crt80_robust = "" if np.isnan(rr["r"]["crt80"]) else round(float(rr["r"]["crt80"]), 2)
-                robust_disp = round(float(rr["track_max"]), 1)
-        except Exception:
-            pass
+    try:
+        import crt_robust
+        rr = crt_robust.measure_robust(work, (cx, cy, size))
+        if rr and rr["r"] is not None and not np.isnan(rr["r"]["crt90"]):
+            crt90_robust = round(float(rr["r"]["crt90"]), 2)
+            crt80_robust = "" if np.isnan(rr["r"]["crt80"]) else round(float(rr["r"]["crt80"]), 2)
+            robust_disp = round(float(rr["track_max"]), 1)
+    except Exception:
+        pass
 
     storage_url, up_note = "", ""
     play = CACHE / f"{req.clip_id}_web.mp4"
@@ -590,7 +577,7 @@ def save(req: SaveReq):
         "roi_cx": cx, "roi_cy": cy, "roi_size": size,
         "crt90_robust_s": crt90_robust, "crt80_robust_s": crt80_robust,
         "robust_track_px": robust_disp,
-        "skin_cx": rscx, "skin_cy": rscy, "skin_size": rss,
+        "skin_cx": int(req.skin_cx), "skin_cy": int(req.skin_cy), "skin_size": int(req.skin_size),
         "notes": req.notes, "clip_id": req.clip_id,
         "storage_url": storage_url, "clip_name": clip_name,
     }

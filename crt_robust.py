@@ -68,8 +68,17 @@ def _tmpl(gray, center, s, W, H):
     return gray[y0:y1, x0:x1]
 
 
-def measure_robust(video_path, box, ref):
-    """box, ref = (cx, cy, size). Returns dict with the recovery result + diagnostics."""
+def _global_a(bgr):
+    """Mean a* of a downsampled whole frame = common-mode lighting/exposure estimate."""
+    h, w = bgr.shape[:2]
+    small = cv2.resize(bgr, (120, max(1, int(120 * h / w))))
+    lab = cv2.cvtColor(small, cv2.COLOR_BGR2LAB).astype(float)
+    return float(lab[:, :, 1].mean() - 128)
+
+
+def measure_robust(video_path, box):
+    """box = (cx, cy, size). Tracks the CRT box and normalizes against overall frame
+    exposure (no reference box). Returns the recovery result + diagnostics."""
     cap = cv2.VideoCapture(str(video_path))
     fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
     ok, bgr = cap.read()
@@ -79,11 +88,10 @@ def measure_robust(video_path, box, ref):
     H, W = bgr.shape[:2]
     g0 = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     tb = _tmpl(g0, box[:2], box[2], W, H)
-    tr = _tmpl(g0, ref[:2], ref[2], W, H)
-    bc, rc, bs, rs = [box[0], box[1]], [ref[0], ref[1]], box[2], ref[2]
+    bc, bs = [box[0], box[1]], box[2]
 
     cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-    ts, Ab, Ar, disp = [], [], [], []
+    ts, Ab, Ag, disp = [], [], [], []
     prev = None
     i = 0
     while True:
@@ -93,9 +101,8 @@ def measure_robust(video_path, box, ref):
         gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
         if i > 0:
             bc, _ = _track(gray, bc, bs, tb, W, H)
-            rc, _ = _track(gray, rc, rs, tr, W, H)
         Ab.append(_a_mean(_patch(bgr, bc, bs, W, H)))
-        Ar.append(_a_mean(_patch(bgr, rc, rs, W, H)))
+        Ag.append(_global_a(bgr))
         ts.append(i / fps)
         if prev is not None:
             disp.append(abs(bc[0] - prev[0]) + abs(bc[1] - prev[1]))
@@ -105,9 +112,9 @@ def measure_robust(video_path, box, ref):
 
     ts = np.array(ts)
     Ab = _fill_nan(Ab)
-    Ar = _fill_nan(Ar)
-    Anorm = Ab - (Ar - np.mean(Ar))            # cancel common-mode lighting wobble
+    Ag = _fill_nan(Ag)
+    Anorm = Ab - (Ag - np.mean(Ag))            # cancel common-mode exposure drift
     r = crt.compute_crt(ts, Anorm)
-    return {"r": r, "ts": ts, "Anorm": Anorm, "Ab": Ab, "Ar": Ar, "fps": fps,
+    return {"r": r, "ts": ts, "Anorm": Anorm, "Ab": Ab, "Aref": Ag, "fps": fps,
             "track_disp": float(np.mean(disp)) if disp else 0.0,
             "track_max": float(np.max(disp)) if disp else 0.0}
