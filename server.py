@@ -12,6 +12,7 @@ Endpoints:
 import base64
 import datetime as dt
 import os
+import subprocess
 import tempfile
 import urllib.parse
 import uuid
@@ -59,6 +60,17 @@ def fb_set(coll, doc_id, data):
     r.raise_for_status()
 
 
+def web_encode(src, dst):
+    """Re-encode to a browser-safe MP4 (yuv420p + faststart) for reviewer playback.
+    Analysis still uses crt.transcode's output, so validation is unaffected."""
+    subprocess.run(
+        [crt.FFMPEG, "-y", "-loglevel", "error", "-i", str(src),
+         "-c:v", "libx264", "-pix_fmt", "yuv420p", "-profile:v", "main",
+         "-movflags", "+faststart", "-an", str(dst)],
+        check=True,
+    )
+
+
 def fb_upload_video(local_path, clip_id):
     obj = urllib.parse.quote(f"clips/{clip_id}.mp4", safe="")
     up = f"https://firebasestorage.googleapis.com/v0/b/{FB_BUCKET}/o?uploadType=media&name={obj}"
@@ -103,6 +115,15 @@ def fb_list(coll):
         row["_id"] = d["name"].split("/")[-1]
         out.append(row)
     return out
+
+
+def fb_get_doc(coll, doc_id):
+    url = f"{FB_BASE}/{coll}/{doc_id}?key={FB_API_KEY}"
+    r = requests.get(url, timeout=20)
+    if r.status_code == 404:
+        return {}
+    r.raise_for_status()
+    return {k: _dec(v) for k, v in r.json().get("fields", {}).items()}
 
 app = FastAPI(title="Refill API")
 app.add_middleware(
@@ -432,10 +453,18 @@ def save(req: SaveReq):
         status = "normal"
 
     storage_url, up_note = "", ""
+    play = CACHE / f"{req.clip_id}_web.mp4"
     try:
-        storage_url = fb_upload_video(work, req.clip_id)
+        try:
+            web_encode(work, play)
+            up_src = play
+        except Exception:
+            up_src = work  # fall back to the analysis file if re-encode fails
+        storage_url = fb_upload_video(up_src, req.clip_id)
     except Exception as e:
         up_note = f" (video upload failed — check Storage rules/bucket: {e})"
+    finally:
+        play.unlink(missing_ok=True)
 
     now = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     safe = "".join(c for c in str(req.subject_id) if c.isalnum() or c in "-_")
@@ -515,6 +544,37 @@ def reading(req: ReadingReq):
     }
     try:
         fb_set("readings", f"{req.clip_id}__{req.reviewer}", row)
+    except Exception as e:
+        return {"ok": False, "error": f"save failed: {e}"}
+    return {"ok": True}
+
+
+# ============================ REGISTERED REVIEWERS ============================
+class ReviewersSetReq(BaseModel):
+    reviewer1: str = ""
+    reviewer2: str = ""
+    passcode: str = ""
+
+
+@app.post("/reviewers")
+def reviewers_get(req: CheckReq):
+    """Return the two registered reviewer names (stored in readings/_config_reviewers)."""
+    if _bad_pass(req.passcode):
+        return {"error": "wrong passcode"}
+    try:
+        c = fb_get_doc("readings", "_config_reviewers")
+    except Exception as e:
+        return {"error": f"could not load: {e}"}
+    return {"reviewer1": c.get("reviewer1", ""), "reviewer2": c.get("reviewer2", "")}
+
+
+@app.post("/reviewers_set")
+def reviewers_set(req: ReviewersSetReq):
+    if _bad_pass(req.passcode):
+        return {"ok": False, "error": "wrong passcode"}
+    try:
+        fb_set("readings", "_config_reviewers",
+               {"reviewer1": req.reviewer1.strip(), "reviewer2": req.reviewer2.strip()})
     except Exception as e:
         return {"ok": False, "error": f"save failed: {e}"}
     return {"ok": True}
@@ -684,6 +744,41 @@ def results(req: ResultsReq):
         "bedside_vs_algo": bed_algo,
     }
     return {"reviewers": reviewers, "rows": rows, "summary": summary}
+
+
+@app.post("/reencode")
+def reencode(req: ResultsReq):
+    """Repair already-stored clips: re-encode each to browser-safe MP4 and re-upload."""
+    if _bad_pass(req.passcode):
+        return {"ok": False, "error": "wrong passcode"}
+    try:
+        meas = fb_list("measurements")
+    except Exception as e:
+        return {"ok": False, "error": f"could not list: {e}"}
+    fixed = failed = 0
+    for m in meas:
+        cid = m.get("clip_id") or m["_id"]
+        url = m.get("storage_url", "")
+        if not url:
+            continue
+        raw = CACHE / f"{cid}_dl.mp4"
+        web = CACHE / f"{cid}_rw.mp4"
+        try:
+            rr = requests.get(url, timeout=120)
+            rr.raise_for_status()
+            raw.write_bytes(rr.content)
+            web_encode(raw, web)
+            new_url = fb_upload_video(web, cid)
+            row = {k: v for k, v in m.items() if k != "_id"}
+            row["storage_url"] = new_url
+            fb_set(FB_COLL, cid, row)
+            fixed += 1
+        except Exception:
+            failed += 1
+        finally:
+            raw.unlink(missing_ok=True)
+            web.unlink(missing_ok=True)
+    return {"ok": True, "fixed": fixed, "failed": failed}
 
 
 # ============================ DELETE A CLIP ============================
