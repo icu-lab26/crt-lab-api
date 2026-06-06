@@ -261,6 +261,15 @@ def check(req: CheckReq):
     return {"ok": not _bad_pass(req.passcode)}
 
 
+def _frame_at_sec(work, sec):
+    cap = cv2.VideoCapture(str(work))
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(sec * fps)))
+    ok, bgr = cap.read()
+    cap.release()
+    return cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB) if ok else None
+
+
 @app.post("/upload")
 async def upload(file: UploadFile = File(...), passcode: str = Form("")):
     """Lightweight: just transcode and return a frame. Analysis happens on /measure,
@@ -279,8 +288,10 @@ async def upload(file: UploadFile = File(...), passcode: str = Form("")):
         raw.unlink(missing_ok=True)
 
     base = _display_frame(work)
+    blanch = _frame_at_sec(work, 0.2)
     W, H = _dims(work)
     return {"clip_id": clip_id, "frame": _jpg_b64(base) if base is not None else None,
+            "frame_blanch": _jpg_b64(blanch) if blanch is not None else None,
             "W": W, "H": H, "roi": [W // 2, H // 2, 80]}
 
 
